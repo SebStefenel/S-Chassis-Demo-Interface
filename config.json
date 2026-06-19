@@ -1,0 +1,32 @@
+{
+  "face_recognition": {
+    "model_name": "Facenet",
+    "detector_backend": "retinaface",
+    "distance_metric": "cosine",
+    "match_threshold": 0.40,
+    "auth_timeout_seconds": 10,
+    "auth_check_every_n_frames": 5
+  },
+  "drowsiness": {
+    "ear_threshold": 0.25,
+    "consecutive_frames_alert": 20,
+    "landmark_model_path": "Drowsiness_Detection/models/shape_predictor_68_face_landmarks.dat"
+  },
+  "database": {
+    "path": "~/Library/Application Support/SDV/sdv_users.db"
+  },
+  "enrollment": {
+    "num_sample_frames": 10,
+    "capture_interval_frames": 8
+  },
+  "camera": {
+    "source": 0,
+    "display_width": 640
+  },
+  "vehicle_settings_defaults": {
+    "seat_position": 3,
+    "mirror_angle": 0,
+    "climate_temp_c": 22,
+    "preferred_radio_station": "Unknown"
+  }
+}
