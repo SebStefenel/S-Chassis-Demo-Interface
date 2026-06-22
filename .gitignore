@@ -9,6 +9,7 @@ dist/
 build/
 .DS_Store
 models/*.onnx
+models/*.task
 ~/.sdv/
 *.db
 *.db-journal
