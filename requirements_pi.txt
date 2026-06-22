@@ -1,0 +1,11 @@
+# SDV Driver Monitor — Raspberry Pi 5 / Linux aarch64
+# Install: pip install -r requirements_pi.txt
+#
+# Total installed size: ~350 MB (vs ~2.6 GB on macOS with TensorFlow)
+
+numpy>=1.24.0
+opencv-python>=4.8.0       # includes YuNet detector + SFace recogniser
+mediapipe>=0.10.0          # 468-point face mesh for EAR drowsiness detection
+Flask>=2.0.0
+flask-cors>=4.0.1
+kuksa-client>=0.4.0        # Eclipse S-CORE / Kuksa Data Broker gRPC client

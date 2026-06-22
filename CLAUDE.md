@@ -2,30 +2,30 @@
 
 ## Project Purpose
 
-A Software-Defined Vehicle (SDV) prototype that simulates an onboard driver management system. When a driver gets into the car, the system:
+A Software-Defined Vehicle (SDV) prototype that simulates an onboard driver management system.
+Target platform: **Raspberry Pi 5, 64-bit Linux, headless, Eclipse S-CORE middleware**.
 
-1. **Authenticates** the driver via live facial recognition (Facenet embeddings, cosine similarity)
-2. **Loads** their personalised vehicle settings (seat position, climate, radio station)
-3. **Monitors** for drowsiness continuously using Eye Aspect Ratio (EAR) via dlib's 68-point facial landmark detector
-4. **Alerts** the driver (visual overlay + stdout) if drowsiness thresholds are breached
+When a driver gets into the car, the system:
 
-The core engineering challenge: two separate open-source repos (deepface for face ID, dlib-based for drowsiness) both wanted exclusive camera access. The solution is a single-camera state machine that shares one `cv2.VideoCapture` instance.
+1. **Authenticates** the driver via live face recognition (SFace embeddings, cosine similarity)
+2. **Loads** their personalised vehicle settings (seat position, climate temp, radio)
+3. **Publishes** the loaded settings as VSS signals to the Eclipse S-CORE Kuksa Data Broker
+4. **Monitors** for drowsiness continuously using Eye Aspect Ratio (EAR) via MediaPipe Face Mesh
+5. **Publishes** a drowsiness level signal (0–10) each monitor frame
 
 ---
 
 ## State Machine
 
 ```
-AUTH ──(face matched)──► MONITOR
-  │                         │
-  └──(timeout)──► UNRECOGNIZED   [A] re-auth
-                     │
-              [E] ENROLLING ──(complete)──► MONITOR
-              [G] ──────────────────────► MONITOR (guest)
-              [R] ──────────────────────► AUTH
+AUTH ──(face matched, dist < threshold)──► MONITOR
+  │                                             │
+  └──(timeout, no match)── re-enters AUTH ◄─────┘
+                                           (future: on-seat sensor or command signal)
 ```
 
-Keys: `Q` quit | `A` re-authenticate | `E` enroll | `G` guest | `R` retry
+No keyboard or display interaction — fully headless. Enrollment is done separately
+via the Flask web server (`enrollment_server.py`) before the monitor starts.
 
 ---
 
@@ -33,43 +33,45 @@ Keys: `Q` quit | `A` re-authenticate | `E` enroll | `G` guest | `R` retry
 
 ```
 FaceDetection/
-├── sdv_monitor.py          # Main entry point — state machine pipeline
-├── enroll_driver.py        # CLI tool to register new drivers
-├── sdv_db.py               # SQLite user/embedding store
+├── sdv_monitor.py          # Main pipeline — AUTH/MONITOR state machine
+├── enrollment_server.py    # Flask web UI for headless face enrollment
+├── inference.py            # YuNet (detect) + SFace (embed) + MediaPipe (EAR)
+├── signals.py              # Eclipse S-CORE / Kuksa Data Broker publisher
+├── sdv_db.py               # SQLite driver profiles + embedding store
 ├── config.json             # All tunable parameters
-├── run_monitor.sh          # Launch script (activates venv)
-├── run_enroll.sh           # Enroll script (activates venv)
-├── requirements_sdv.txt    # Unified dependency list
-├── deepface/               # Local deepface repo (face recognition engine)
-├── Drowsiness_Detection/   # Source repo — dlib EAR drowsiness code
-│   └── models/
-│       └── shape_predictor_68_face_landmarks.dat   # dlib landmark model
-└── venv/                   # Python 3.11 virtual environment
-```
+├── requirements_pi.txt     # Pi dependency list (~350 MB installed)
+├── setup_pi.sh             # One-shot Pi setup: venv + packages + ONNX models
+├── sdv.service             # systemd unit — auto-start monitor on boot
+└── models/                 # Downloaded by setup_pi.sh
+    ├── face_detection_yunet_2023mar.onnx    (~400 KB)
+    └── face_recognition_sface_2021dec.onnx  (~37 MB)
 
-Database stored at: `~/Library/Application Support/SDV/sdv_users.db`
+Database: ~/.sdv/sdv_users.db
+```
 
 ---
 
-## Running (macOS)
+## Running on Pi
 
 ```bash
-cd ~/Documents/Infosys/FaceDetection
+# One-time setup (installs packages + downloads models)
+bash setup_pi.sh
 
-# Enroll a driver
-./run_enroll.sh -u YourName
+# Enrol a driver (do this before starting the monitor)
+# Open http://<pi-ip>:5000 on any phone/laptop on the same network
+source venv/bin/activate && python enrollment_server.py
 
-# Run the monitor
-./run_monitor.sh
+# Run the monitor (Ctrl+C to stop)
+source venv/bin/activate && python sdv_monitor.py
 
-# List enrolled drivers
-./run_enroll.sh --list
+# Install as auto-start systemd service
+sudo cp sdv.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable sdv && sudo systemctl start sdv
 
-# Delete a profile
-./run_enroll.sh --delete YourName
+# View live logs
+journalctl -u sdv -f
 ```
-
-**macOS requirement:** Terminal must have Full Disk Access enabled in System Settings → Privacy & Security → Full Disk Access. F-Secure (if installed) must also have the Python binary or project directory whitelisted.
 
 ---
 
@@ -78,194 +80,95 @@ cd ~/Documents/Infosys/FaceDetection
 ```json
 {
   "face_recognition": {
-    "model_name": "Facenet",            // recognition model
-    "detector_backend": "retinaface",   // face detector (see Pi notes)
-    "distance_metric": "cosine",
-    "match_threshold": 0.40,            // lower = stricter matching
-    "auth_timeout_seconds": 10,
-    "auth_check_every_n_frames": 5
+    "match_threshold": 0.40,          // cosine dist — lower = stricter
+    "auth_timeout_seconds": 10,       // retry AUTH after this many seconds with no match
+    "auth_check_every_n_frames": 5    // skip frames to save CPU in AUTH mode
+  },
+  "models": {
+    "det_model": "models/face_detection_yunet_2023mar.onnx",
+    "rec_model": "models/face_recognition_sface_2021dec.onnx"
   },
   "drowsiness": {
-    "ear_threshold": 0.25,              // EAR below this = eye closed
-    "consecutive_frames_alert": 20,     // frames closed before alert fires
-    "landmark_model_path": "Drowsiness_Detection/models/shape_predictor_68_face_landmarks.dat"
+    "ear_threshold": 0.25,            // EAR below this = eye considered closed
+    "consecutive_frames_alert": 20    // closed-eye frames before alert fires
+  },
+  "database": {
+    "path": "~/.sdv/sdv_users.db"
   },
   "enrollment": {
-    "num_sample_frames": 10,            // face samples captured per enroll
+    "num_sample_frames": 10,          // face samples captured per enrolment
     "capture_interval_frames": 8
   },
   "camera": {
-    "source": 0,                        // 0 = default webcam
-    "display_width": 640
+    "source": 0                       // 0 = /dev/video0 (USB or Pi CSI via v4l2)
+  },
+  "score": {
+    "host": "127.0.0.1",             // Kuksa Data Broker address
+    "port": 55555
   }
 }
 ```
 
 ---
 
-## Key Implementation Notes
+## Eclipse S-CORE Integration
 
-- **SQLite quirk (macOS):** The db uses `isolation_level=None` (autocommit) and `PRAGMA journal_mode=MEMORY` to avoid `fcntl` file-locking failures caused by macOS security restrictions on Homebrew Python.
-- **No `silent` param:** The local deepface version does not support the `silent` kwarg in `DeepFace.represent()` — do not add it back.
-- **Deepface path:** Both `sdv_monitor.py` and `enroll_driver.py` do `sys.path.insert(0, "deepface")` — deepface is NOT pip-installed, it's used from the local folder.
-- **venv installed via uv + staging:** macOS sandbox blocks Python's `os.rename()` in site-packages, so packages were installed to `/tmp/sdv_staging` then `cp -r`'d into the venv.
+The system uses the **Kuksa Data Broker** (part of Eclipse S-CORE) as the vehicle signal bus.
+Python client: `kuksa-client` (gRPC). All signals follow VSS paths.
+
+**Signals published:**
+
+| VSS Path | Type | Description |
+|---|---|---|
+| `Vehicle.Driver.IsAuthenticated` | bool | True once driver is matched |
+| `Vehicle.Driver.Identifier` | string | Driver name ("" while scanning) |
+| `Vehicle.Driver.DrowsinessLevel` | uint8 | 0 (alert) → 10 (very drowsy) |
+| `Vehicle.Driver.AttentionLvl` | string | "ATTENTIVE" or "ALERT" |
+| `Vehicle.Cabin.Seat.Row1.DriverSide.Position` | uint8 | Driver's saved seat position |
+| `Vehicle.Cabin.HVAC.AmbientAirTemperature` | float | Driver's saved climate temp |
+
+If `kuksa-client` is not installed or the broker is unreachable, `signals.py` logs
+signals to stdout and continues — the monitor never crashes due to a missing broker.
 
 ---
 
-## Raspberry Pi — Required Changes
+## ML Stack (Pi-native, no TensorFlow)
 
-### Target: Raspberry Pi 4/5, 64-bit Linux (Raspberry Pi OS or Ubuntu)
-
-The current Mac stack will NOT run on Pi without significant changes. Here is the full migration plan:
-
-### 1. Replace TensorFlow with TensorFlow Lite
-
-Full TF 2.x is 2.6 GB installed and far too slow on Pi's ARM CPU.
-
-```bash
-# Instead of tensorflow:
-pip install tflite-runtime  # ~5 MB, ARM-optimised
-```
-
-The Facenet model needs to be converted:
-```python
-# On Mac/PC, convert once:
-import tensorflow as tf
-converter = tf.lite.TFLiteConverter.from_keras_model(facenet_model)
-converter.optimizations = [tf.lite.Optimize.DEFAULT]  # quantise to INT8
-tflite_model = converter.convert()
-open("facenet_int8.tflite", "wb").write(tflite_model)
-```
-
-Then replace `DeepFace.represent()` with a direct TFLite inference wrapper. deepface itself won't be used on Pi — it depends on full TF.
-
-### 2. Replace RetinaFace with MediaPipe or YuNet
-
-RetinaFace (current detector) is too slow on Pi (~500ms/frame). Alternatives:
-
-| Detector | Pi 4 latency | Notes |
-|---|---|---|
-| `mediapipe` | ~30ms | Best choice — Google's ARM-optimised graph |
-| `yunet` (OpenCV) | ~20ms | Built into OpenCV 4.8+, no extra install |
-| `opencv` Haar | ~15ms | Least accurate but fastest |
-
-Recommended for Pi: **YuNet** — zero extra deps (built into OpenCV), ~20ms, good accuracy.
-
-```python
-# config.json on Pi:
-"detector_backend": "yunet"   # or "opencv" as fallback
-```
-
-### 3. Replace dlib with MediaPipe Face Mesh
-
-dlib's 68-point landmark detector works on Pi but is slow (~150ms). MediaPipe Face Mesh gives 468 landmarks at ~20ms.
-
-```bash
-pip install mediapipe
-```
-
-The EAR calculation stays identical — just swap which landmark indices you read. MediaPipe's equivalent eye indices are documented in its Face Mesh topology map.
-
-### 4. Camera: Use Pi Camera Module (CSI)
-
-The Pi Camera (CSI ribbon cable) is faster and lower-latency than USB webcams.
-
-```python
-# config.json
-"camera": { "source": 0 }   // still works for Pi Camera via v4l2
-
-# Or use picamera2 for better control:
-pip install picamera2
-```
-
-If using `picamera2`, wrap it in an OpenCV-compatible adapter.
-
-### 5. Display / Headless Mode
-
-Pi may run headless (no monitor) or with a small HDMI/DSI display.
-
-Add to config:
-```json
-"display": {
-  "enabled": true,          // false = headless, log to stdout only
-  "width": 480              // smaller for 3.5" DSI displays
-}
-```
-
-Guard all `cv2.imshow()` / `cv2.waitKey()` calls with the display flag.
-
-### 6. GPIO Alerts (Optional but Realistic)
-
-Replace the visual alert with physical hardware:
-
-```python
-import RPi.GPIO as GPIO
-BUZZER_PIN = 17
-LED_PIN = 27
-
-def trigger_alert():
-    GPIO.output(BUZZER_PIN, GPIO.HIGH)   # sound buzzer
-    GPIO.output(LED_PIN, GPIO.HIGH)      # flash LED
-```
-
-### 7. Pi-Specific requirements_pi.txt
-
-```
-# Core
-numpy>=1.24.0
-opencv-python>=4.8.0        # includes YuNet detector
-mediapipe>=0.10.0
-tflite-runtime>=2.14.0
-scipy>=1.7.0
-imutils>=0.5.4
-picamera2>=0.3.0            # optional, for CSI camera
-RPi.GPIO>=0.7.0             # optional, for buzzer/LED alerts
-
-# Removed vs Mac version:
-# tensorflow        (too large)
-# dlib              (replaced by mediapipe)
-# deepface          (replaced by direct TFLite)
-# retina-face       (replaced by yunet/mediapipe)
-```
-
-### 8. Face Recognition Model Alternative
-
-If Facenet TFLite is complex to convert, use **MobileFaceNet** instead:
-- Pre-converted TFLite available publicly
-- 99% of Facenet accuracy at 10% of the compute cost
-- ~1MB model file vs 87MB Facenet
-
-### Performance Budget (Pi 4, ARM Cortex-A72 @ 1.8GHz)
-
-| Operation | Current (Mac) | Target (Pi) | How |
+| Task | Library | Model | Latency Pi 5 |
 |---|---|---|---|
-| Face detection | ~50ms (retinaface) | ~20ms | YuNet |
-| Face embedding | ~200ms (Facenet/TF) | ~80ms | MobileFaceNet/TFLite |
-| EAR calculation | ~5ms (dlib) | ~20ms | MediaPipe |
-| Total auth frame | ~260ms | ~120ms | ~8 FPS auth |
-| Total monitor frame | ~10ms | ~25ms | ~40 FPS monitor |
+| Face detection | OpenCV `cv2.FaceDetectorYN` | YuNet ONNX | ~20ms |
+| Face embedding | OpenCV `cv2.FaceRecognizerSF` | SFace ONNX | ~40ms |
+| Landmark EAR | MediaPipe Face Mesh | built-in | ~20ms |
+| Total (auth frame) | — | — | ~80ms |
+| Total (monitor frame) | — | — | ~25ms |
 
-### Android on Raspberry Pi
+Both YuNet and SFace are bundled with OpenCV 4.8+ — no TFLite or tflite-runtime needed.
 
-Running Android (LineageOS) on Pi 4 is possible but adds significant complexity:
-- The Python stack does not run on Android without Termux or similar
-- The realistic path is a native Android app using:
-  - **ML Kit Face Detection** (Google, free, on-device)
-  - **TFLite Android API** for custom models
-  - **CameraX** for camera access
-- This is a full rewrite in Kotlin/Java, not a port of the Python code
+---
 
-**Recommendation:** Target Linux on Pi first, then consider an Android companion app later.
+## Enrollment Web UI
+
+`enrollment_server.py` runs a Flask server at `http://<pi-ip>:5000`.
+
+- Open on phone/laptop browser — no display or keyboard on the Pi needed
+- Enter driver name → click Enroll
+- Live progress bar as samples are captured
+- Driver list with delete buttons
+- The enrollment server and the monitor **cannot share the camera simultaneously** —
+  enrol drivers first, then start the monitor
 
 ---
 
 ## Development Status
 
-- [x] Mac development environment working
-- [x] Face enrollment (`enroll_driver.py`)
-- [x] Auth + drowsiness monitor state machine (`sdv_monitor.py`)
-- [x] SQLite driver profile storage (`sdv_db.py`)
-- [ ] Raspberry Pi port (TFLite + MediaPipe + YuNet)
-- [ ] Headless/display toggle
-- [ ] GPIO alert integration
-- [ ] Android app
+- [x] Pi-native ML stack (YuNet + SFace, no TensorFlow)
+- [x] Headless monitor (`sdv_monitor.py`, no `cv2.imshow`)
+- [x] Headless enrollment web UI (`enrollment_server.py`)
+- [x] Eclipse S-CORE / Kuksa signal publishing (`signals.py`)
+- [x] Clean SQLite store (`sdv_db.py`, standard locking)
+- [x] systemd service unit (`sdv.service`)
+- [x] One-shot Pi setup script (`setup_pi.sh`)
+- [ ] Pi Camera Module (CSI) support — currently uses `/dev/video0` via v4l2
+- [ ] GPIO alert (buzzer/LED on drowsiness)
+- [ ] Subscribe to S-CORE command signals (e.g., re-auth on door open)
+- [ ] Android companion app (separate Kotlin project, ML Kit)

@@ -1,27 +1,30 @@
 {
   "face_recognition": {
-    "model_name": "Facenet",
-    "detector_backend": "retinaface",
-    "distance_metric": "cosine",
     "match_threshold": 0.40,
     "auth_timeout_seconds": 10,
     "auth_check_every_n_frames": 5
   },
+  "models": {
+    "det_model": "models/face_detection_yunet_2023mar.onnx",
+    "rec_model": "models/face_recognition_sface_2021dec.onnx"
+  },
   "drowsiness": {
     "ear_threshold": 0.25,
-    "consecutive_frames_alert": 20,
-    "landmark_model_path": "Drowsiness_Detection/models/shape_predictor_68_face_landmarks.dat"
+    "consecutive_frames_alert": 20
   },
   "database": {
-    "path": "~/Library/Application Support/SDV/sdv_users.db"
+    "path": "~/.sdv/sdv_users.db"
   },
   "enrollment": {
     "num_sample_frames": 10,
     "capture_interval_frames": 8
   },
   "camera": {
-    "source": 0,
-    "display_width": 640
+    "source": 0
+  },
+  "score": {
+    "host": "127.0.0.1",
+    "port": 55555
   },
   "vehicle_settings_defaults": {
     "seat_position": 3,
