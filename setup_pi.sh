@@ -25,9 +25,10 @@ mkdir -p models
 
 DET_URL="https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 REC_URL="https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
+LM_URL="https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 
 if [ ! -f models/face_detection_yunet_2023mar.onnx ]; then
-    echo "  Downloading YuNet face detector (~400 KB)…"
+    echo "  Downloading YuNet face detector (~228 KB)…"
     wget -q --show-progress -O models/face_detection_yunet_2023mar.onnx "$DET_URL"
 else
     echo "  YuNet model already present, skipping."
@@ -38,6 +39,13 @@ if [ ! -f models/face_recognition_sface_2021dec.onnx ]; then
     wget -q --show-progress -O models/face_recognition_sface_2021dec.onnx "$REC_URL"
 else
     echo "  SFace model already present, skipping."
+fi
+
+if [ ! -f models/face_landmarker.task ]; then
+    echo "  Downloading MediaPipe FaceLandmarker (~3.6 MB)…"
+    wget -q --show-progress -O models/face_landmarker.task "$LM_URL"
+else
+    echo "  FaceLandmarker model already present, skipping."
 fi
 
 # 4. Create database directory

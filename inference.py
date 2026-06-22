@@ -2,12 +2,13 @@
 Face inference engine for Raspberry Pi.
 
 Uses OpenCV's built-in YuNet detector and SFace recogniser (both ONNX,
-no extra install beyond opencv-python >=4.8).  MediaPipe Face Mesh is used
-for the 468-landmark EAR calculation needed by the drowsiness monitor.
+no extra install beyond opencv-python >=4.8).  MediaPipe FaceLandmarker
+(Tasks API, 0.10+) is used for the 468-landmark EAR calculation.
 
 Model files (download via setup_pi.sh):
-  models/face_detection_yunet_2023mar.onnx   ~400 KB
+  models/face_detection_yunet_2023mar.onnx   ~228 KB
   models/face_recognition_sface_2021dec.onnx  ~37 MB
+  models/face_landmarker.task                 ~3.6 MB
 """
 
 import logging
@@ -26,27 +27,33 @@ _R_EYE = [362, 385, 387, 263, 373, 380]
 class FaceEngine:
     """Wraps face detection (YuNet) + recognition (SFace) + landmark EAR (MediaPipe)."""
 
-    def __init__(self, det_model: str, rec_model: str) -> None:
+    def __init__(self, det_model: str, rec_model: str, landmark_model: str = "") -> None:
         self._detector = cv2.FaceDetectorYN.create(
             det_model, "", (320, 320),
             score_threshold=0.6, nms_threshold=0.3, top_k=1,
         )
         self._recognizer = cv2.FaceRecognizerSF.create(rec_model, "")
 
-        try:
-            import mediapipe as mp
-            self._mesh = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=False,
-                max_num_faces=1,
-                refine_landmarks=False,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
-            )
-            self._mp_ok = True
-        except ImportError:
-            log.warning("mediapipe not installed — drowsiness EAR will be disabled")
-            self._mesh = None
-            self._mp_ok = False
+        self._landmarker = None
+        self._mp_ok = False
+        if landmark_model:
+            try:
+                import mediapipe as mp
+                from mediapipe.tasks.python import vision as mp_vision
+                from mediapipe.tasks import python as mp_python
+
+                options = mp_vision.FaceLandmarkerOptions(
+                    base_options=mp_python.BaseOptions(model_asset_path=landmark_model),
+                    num_faces=1,
+                    min_face_detection_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                )
+                self._landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+                self._mp = mp
+                self._mp_ok = True
+                log.info("MediaPipe FaceLandmarker loaded.")
+            except Exception as exc:
+                log.warning("MediaPipe FaceLandmarker failed to load (%s) — EAR disabled", exc)
 
     # ── face embedding ────────────────────────────────────────────────────────
 
@@ -65,14 +72,20 @@ class FaceEngine:
     # ── Eye Aspect Ratio ──────────────────────────────────────────────────────
 
     def ear(self, frame: np.ndarray) -> Optional[float]:
-        """Return mean EAR for both eyes via MediaPipe, or None if no face."""
+        """Return mean EAR for both eyes via MediaPipe Tasks API, or None."""
         if not self._mp_ok:
             return None
+
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = self._mesh.process(rgb)
-        if not result.multi_face_landmarks:
+        mp_image = self._mp.Image(
+            image_format=self._mp.ImageFormat.SRGB,
+            data=rgb,
+        )
+        result = self._landmarker.detect(mp_image)
+        if not result.face_landmarks:
             return None
-        lm = result.multi_face_landmarks[0].landmark
+
+        lm = result.face_landmarks[0]
         h, w = frame.shape[:2]
 
         def pt(idx: int) -> np.ndarray:

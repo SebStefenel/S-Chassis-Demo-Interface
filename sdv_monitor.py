@@ -114,6 +114,7 @@ class SDVMonitor:
         self.engine = FaceEngine(
             os.path.join(_HERE, models["det_model"]),
             os.path.join(_HERE, models["rec_model"]),
+            os.path.join(_HERE, models.get("landmark_model", "")),
         )
 
         score_cfg = config.get("score", {})

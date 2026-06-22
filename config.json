@@ -6,7 +6,8 @@
   },
   "models": {
     "det_model": "models/face_detection_yunet_2023mar.onnx",
-    "rec_model": "models/face_recognition_sface_2021dec.onnx"
+    "rec_model": "models/face_recognition_sface_2021dec.onnx",
+    "landmark_model": "models/face_landmarker.task"
   },
   "drowsiness": {
     "ear_threshold": 0.25,

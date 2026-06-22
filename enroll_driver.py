@@ -52,6 +52,7 @@ def enroll(username: str, config: dict) -> bool:
     engine = FaceEngine(
         os.path.join(_HERE, config["models"]["det_model"]),
         os.path.join(_HERE, config["models"]["rec_model"]),
+        os.path.join(_HERE, config["models"].get("landmark_model", "")),
     )
 
     existing = sdv_db.get_user_by_name(db_path, username)

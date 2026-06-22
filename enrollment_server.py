@@ -211,6 +211,7 @@ def _enroll_worker(name: str, config: dict) -> None:
     engine = FaceEngine(
         os.path.join(_HERE, models["det_model"]),
         os.path.join(_HERE, models["rec_model"]),
+        os.path.join(_HERE, models.get("landmark_model", "")),
     )
 
     existing = sdv_db.get_user_by_name(db_path, name)
