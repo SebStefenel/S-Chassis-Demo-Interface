@@ -22,6 +22,10 @@
   "camera": {
     "source": 0
   },
+  "display": {
+    "enabled": true,
+    "width": 640
+  },
   "score": {
     "host": "127.0.0.1",
     "port": 55555

@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-SDV Driver Monitor — headless pipeline for Raspberry Pi + Eclipse S-CORE.
+SDV Driver Monitor — with optional live display overlay.
 
 State machine:
   AUTH    → runs SFace embedding every N frames, compares against enrolled drivers.
             On match: transitions to MONITOR and publishes authenticated signal.
             On timeout with no match: retries (logs unrecognized, publishes signal).
   MONITOR → MediaPipe EAR drowsiness detection, publishes DrowsinessLevel signal.
+
+Display mode (config display.enabled = true):
+  Opens a cv2 window showing the live camera feed with overlays:
+  - Header strip: current state, driver name
+  - EAR value indicator (green / red)
+  - Drowsiness alert: red border + warning text
+  - Press Q to quit
 
 Signals published to Eclipse S-CORE (Kuksa Data Broker, gRPC port 55555):
   Vehicle.Driver.IsAuthenticated
@@ -46,6 +53,9 @@ logging.basicConfig(
 log = logging.getLogger("sdv.monitor")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+
+_FONT = cv2.FONT_HERSHEY_SIMPLEX
+_WINDOW = "SDV Monitor"
 
 
 class State(Enum):
@@ -89,6 +99,7 @@ class SDVMonitor:
         self.cfg = config
         fr = config["face_recognition"]
         drw = config["drowsiness"]
+        disp = config.get("display", {})
 
         self.db_path = _resolve_db(config)
         self.match_threshold = fr["match_threshold"]
@@ -96,6 +107,8 @@ class SDVMonitor:
         self.auth_interval = fr["auth_check_every_n_frames"]
         self.ear_thresh = drw["ear_threshold"]
         self.ear_frames = drw["consecutive_frames_alert"]
+        self.display_enabled = disp.get("enabled", True)
+        self.display_width = disp.get("width", 640)
 
         models = config["models"]
         self.engine = FaceEngine(
@@ -115,6 +128,7 @@ class SDVMonitor:
         self._auth_frame = 0
         self._ear_flag = 0
         self._is_drowsy = False
+        self._last_ear: Optional[float] = None
         self._driver_name: Optional[str] = None
         self._running = True
 
@@ -124,6 +138,7 @@ class SDVMonitor:
         self.state = State.AUTH
         self._auth_start = time.time()
         self._auth_frame = 0
+        self._last_ear = None
         self._enrolled = sdv_db.get_all_embeddings(self.db_path)
         self._driver_name = None
         unique = len(set(n for _, n, _ in self._enrolled))
@@ -136,6 +151,7 @@ class SDVMonitor:
         self._driver_name = name
         self._ear_flag = 0
         self._is_drowsy = False
+        self._last_ear = None
         log.info("MONITOR — driver authenticated: %s", name)
         self.pub.authenticated(name, settings)
 
@@ -170,6 +186,8 @@ class SDVMonitor:
         if ear is None:
             return
 
+        self._last_ear = ear
+
         if ear < self.ear_thresh:
             self._ear_flag += 1
         else:
@@ -182,6 +200,50 @@ class SDVMonitor:
         if self._is_drowsy and not was_drowsy:
             log.warning("*** DROWSINESS ALERT — driver: %s  EAR=%.3f ***", self._driver_name, ear)
 
+    # ── display overlay ───────────────────────────────────────────────────────
+
+    def _draw_overlay(self, frame: np.ndarray) -> np.ndarray:
+        h, w = frame.shape[:2]
+        scale = self.display_width / w
+        disp = cv2.resize(frame, (self.display_width, int(h * scale)))
+        dh, dw = disp.shape[:2]
+
+        # Header strip
+        cv2.rectangle(disp, (0, 0), (dw, 52), (18, 18, 18), -1)
+
+        if self.state is State.AUTH:
+            elapsed = time.time() - self._auth_start
+            remaining = max(0.0, self.auth_timeout - elapsed)
+            label = f"AUTH  Scanning…  ({remaining:.0f}s)"
+            label_color = (60, 200, 255)  # amber
+        else:
+            label = f"MONITOR  |  {self._driver_name or 'Unknown'}"
+            label_color = (80, 220, 80)  # green
+
+        cv2.putText(disp, label, (10, 37), _FONT, 0.80, label_color, 2, cv2.LINE_AA)
+
+        # EAR value (MONITOR mode only)
+        if self.state is State.MONITOR and self._last_ear is not None:
+            ear = self._last_ear
+            ear_col = (80, 220, 80) if ear >= self.ear_thresh else (40, 60, 240)
+            cv2.putText(disp, f"EAR {ear:.3f}", (dw - 145, 37),
+                        _FONT, 0.75, ear_col, 2, cv2.LINE_AA)
+
+        # Drowsiness alert — pulsing red border + banner
+        if self._is_drowsy:
+            cv2.rectangle(disp, (0, 0), (dw - 1, dh - 1), (30, 30, 220), 10)
+            banner_h = 48
+            cv2.rectangle(disp, (0, dh - banner_h), (dw, dh), (20, 20, 180), -1)
+            cv2.putText(disp, "!  DROWSINESS ALERT  !",
+                        (dw // 2 - 195, dh - 13),
+                        _FONT, 0.95, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # Q to quit hint
+        cv2.putText(disp, "Q — quit", (8, dh - 8 if not self._is_drowsy else dh - banner_h - 8),
+                    _FONT, 0.42, (90, 90, 90), 1, cv2.LINE_AA)
+
+        return disp
+
     # ── main loop ─────────────────────────────────────────────────────────────
 
     def run(self) -> None:
@@ -193,7 +255,12 @@ class SDVMonitor:
         if not cap.isOpened():
             log.error("Cannot open camera source: %s", cam_src)
             sys.exit(1)
-        log.info("Camera opened (source=%s).", cam_src)
+        log.info("Camera opened (source=%s). Display=%s.", cam_src, self.display_enabled)
+
+        if self.display_enabled:
+            cv2.namedWindow(_WINDOW, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(_WINDOW, self.display_width,
+                             int(self.display_width * 0.75))
 
         def _handle_stop(sig, frame):
             log.info("Signal %d received — shutting down.", sig)
@@ -214,21 +281,37 @@ class SDVMonitor:
             else:
                 self._tick_monitor(frame)
 
-            time.sleep(0.02)  # ~50 FPS ceiling; keeps CPU usage sane on Pi
+            if self.display_enabled:
+                cv2.imshow(_WINDOW, self._draw_overlay(frame))
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q") or key == 27:  # Q or Esc
+                    log.info("Quit key pressed.")
+                    break
+            else:
+                time.sleep(0.02)  # ~50 FPS ceiling; keeps CPU usage sane on Pi
 
         cap.release()
+        if self.display_enabled:
+            cv2.destroyAllWindows()
         self.pub.close()
         log.info("Monitor stopped cleanly.")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="SDV headless driver monitor")
+    parser = argparse.ArgumentParser(description="SDV driver monitor")
     parser.add_argument(
         "--config", default=os.path.join(_HERE, "config.json"),
         help="Path to config.json (default: ./config.json)",
     )
+    parser.add_argument(
+        "--no-display", action="store_true",
+        help="Force headless mode regardless of config",
+    )
     args = parser.parse_args()
-    SDVMonitor(_load_config(args.config)).run()
+    config = _load_config(args.config)
+    if args.no_display:
+        config.setdefault("display", {})["enabled"] = False
+    SDVMonitor(config).run()
 
 
 if __name__ == "__main__":
