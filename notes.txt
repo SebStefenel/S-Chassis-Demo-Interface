@@ -1,0 +1,5 @@
+
+
+
+
+eventually we can add other options that make it so that the history file can start determining paterns and prompt you based on these patterns
