@@ -205,13 +205,25 @@ def chat_completion(client, messages: list[dict], temperature: float = 0.7,
 _EXTRACT_SYSTEM = """\
 You are a memory-extraction assistant for an in-car AI system.
 Given a conversation transcript, extract ONLY new long-term facts about the driver
-that are worth remembering across future sessions (preferences, habits, personal details,
-frequently-asked topics). Do NOT re-extract facts already listed in the existing profile.
+that are worth remembering across future sessions. Do NOT re-extract facts already
+listed in the existing profile.
+
+Prioritise SPECIFIC, CONCRETE facts over vague generalisations. Examples of good facts:
+  - "Driver visited Patty's burger joint and enjoyed it" (not "driver likes burgers")
+  - "Driver prefers chicken and beef burger options" (not "driver asks about menu items")
+  - "Driver likes jazz music" (not "driver asks about music")
+
+Capture all of the following when present:
+  - Specific places visited and whether the driver liked or disliked them
+  - Named preferences (specific foods, artists, genres, settings)
+  - Concrete habits or recurring behaviours
+  - Personal details explicitly shared
 
 Return ONLY a JSON array of objects with exactly these keys:
   "category": one of: food_preference | music_preference | driving_habit |
-               vehicle_setting | personal_detail | frequent_request | general
-  "fact": a short, clear, self-contained statement about the driver (not the conversation)
+               vehicle_setting | personal_detail | frequent_request | experience | general
+  "fact": a short, specific, self-contained statement about the driver (not the conversation).
+          Always name specific places/items when mentioned. Never write generic summaries.
   "confidence": "high" | "medium" | "low"
 
 If nothing new is worth storing, return an empty array [].
