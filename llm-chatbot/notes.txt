@@ -1,0 +1,5 @@
+
+right now it has no address/actuall info all of the locations and everything it is giving me are completly made up
+
+
+eventually we can add other options that make it so that the history file can start determining paterns and prompt you based on these patterns

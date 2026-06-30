@@ -1,0 +1,14 @@
+# Secrets — never commit the real key
+.env
+
+# Runtime data
+vehicle_history.json
+__pycache__/
+*.pyc
+*.pyo
+
+# Streamlit
+.streamlit/
+
+# macOS
+.DS_Store
