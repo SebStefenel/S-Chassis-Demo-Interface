@@ -25,6 +25,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Optional, Tuple
 
@@ -187,22 +188,42 @@ class DemoOrchestrator:
     def _run_unrecognized_prompt(self, cap) -> str:
         """
         Show a popup asking whether to enroll or retry.
+        Accepts both keypresses AND voice commands simultaneously.
+        Voice runs in a background thread so the camera display keeps updating.
         Returns 'enroll', 'retry', or 'quit'.
-        On headless Pi the same question is printed to the terminal (SSH session).
         """
         if not self.display_enabled:
             print("\n[S-Chassis] Driver not recognised.")
-            print("  [N]  Create new profile")
-            print("  [R]  Try again")
-            print("  [Q]  Quit")
+            print("  Say 'new profile'  or press [N]  — create new profile")
+            print("  Say 'try again'    or press [R]  — retry recognition")
+            print("  Say 'quit'         or press [Q]  — quit")
+            # Voice + keyboard both work in headless mode
+            voice_result: list = []
+            t = threading.Thread(
+                target=self._voice_listen_for_action, args=(voice_result,), daemon=True
+            )
+            t.start()
             while True:
-                choice = input("Choose: ").strip().lower()
-                if choice == "n":
-                    return "enroll"
-                elif choice == "r":
-                    return "retry"
-                elif choice == "q":
-                    return "quit"
+                if voice_result:
+                    return voice_result[0]
+                # Non-blocking stdin peek isn't reliable cross-platform;
+                # fall back to blocking input only if voice thread finishes empty.
+                if not t.is_alive() and not voice_result:
+                    choice = input("Choose (N/R/Q): ").strip().lower()
+                    if choice == "n":
+                        return "enroll"
+                    elif choice == "r":
+                        return "retry"
+                    elif choice == "q":
+                        return "quit"
+                time.sleep(0.1)
+
+        # Display mode — voice thread runs alongside cv2 loop
+        voice_result: list = []
+        t = threading.Thread(
+            target=self._voice_listen_for_action, args=(voice_result,), daemon=True
+        )
+        t.start()
 
         while self._running:
             ret, frame = cap.read()
@@ -217,7 +238,27 @@ class DemoOrchestrator:
                 return "retry"
             elif key in (ord("q"), 27):
                 return "quit"
+            if voice_result:
+                return voice_result[0]
+
         return "quit"
+
+    def _voice_listen_for_action(self, result: list) -> None:
+        """Background thread: listen for a voice command and map it to an action."""
+        try:
+            from voice import listen_once
+        except Exception as exc:
+            log.warning("Voice not available: %s", exc)
+            return
+        log.info("Listening for voice command…")
+        text = listen_once(timeout=30.0).lower()
+        log.info("Voice heard: '%s'", text)
+        if any(w in text for w in ("new", "enroll", "profile", "create", "register")):
+            result.append("enroll")
+        elif any(w in text for w in ("retry", "try", "again", "scan", "repeat")):
+            result.append("retry")
+        elif any(w in text for w in ("quit", "exit", "stop", "bye", "end")):
+            result.append("quit")
 
     def _draw_unrecognized_popup(self, frame: np.ndarray) -> np.ndarray:
         disp = self._resize(frame)
@@ -246,28 +287,52 @@ class DemoOrchestrator:
                     (x1 + 30, y1 + 185), _FONT, 0.60, (130, 130, 130), 1, cv2.LINE_AA)
         return disp
 
+    def _ask_name_by_voice(self, cap) -> str:
+        """
+        Prompt the driver to say their name. Shows an overlay while listening.
+        Falls back to terminal input if voice returns empty.
+        """
+        try:
+            from voice import listen_once
+            has_voice = True
+        except Exception:
+            has_voice = False
+
+        if self.display_enabled and has_voice:
+            # Show "say your name" overlay for 2 seconds, then listen
+            for _ in range(20):
+                ret, frame = cap.read()
+                if ret:
+                    disp = self._resize(frame)
+                    cv2.rectangle(disp, (0, 0), (disp.shape[1], 52), (18, 18, 18), -1)
+                    cv2.putText(disp, "Say your name clearly…",
+                                (10, 37), _FONT, 0.80, (255, 200, 60), 2, cv2.LINE_AA)
+                    cv2.imshow(_WINDOW, disp)
+                    cv2.waitKey(100)
+
+        if has_voice:
+            log.info("Listening for driver name…")
+            name = listen_once(timeout=5.0).strip().title()
+            log.info("Heard name: '%s'", name)
+        else:
+            name = ""
+
+        if not name:
+            name = input("Could not hear name — type it here: ").strip()
+
+        return name
+
     # ── Inline enrollment ─────────────────────────────────────────────────────
 
     def _run_inline_enrollment(self, cap) -> Optional[Tuple[int, str]]:
         """
         Capture face embeddings for a new driver directly from the live camera.
-        Name is entered via the terminal (one-time setup; SSH works fine on Pi).
+        Driver says their name aloud; falls back to terminal input if voice fails.
         Returns (uid, name) on success, None on cancel.
         """
-        # Briefly show "check the terminal" so the user isn't confused
-        if self.display_enabled:
-            ret, frame = cap.read()
-            if ret:
-                disp = self._resize(frame)
-                cv2.rectangle(disp, (0, 0), (disp.shape[1], 52), (18, 18, 18), -1)
-                cv2.putText(disp, "Type your name in the terminal, then press Enter…",
-                            (10, 37), _FONT, 0.65, (255, 200, 60), 2, cv2.LINE_AA)
-                cv2.imshow(_WINDOW, disp)
-                cv2.waitKey(200)
-
-        name = input("\nEnter a name for the new profile: ").strip()
+        name = self._ask_name_by_voice(cap)
         if not name:
-            log.info("Enrollment cancelled — no name entered.")
+            log.info("Enrollment cancelled — no name provided.")
             return None
 
         existing = sdv_db.get_user_by_name(self.db_path, name)
@@ -366,6 +431,7 @@ class DemoOrchestrator:
 
         env = os.environ.copy()
         env["SDV_DRIVER_NAME"] = name
+        env["SDV_ROOT"] = _ROOT     # lets sdv_chatbot.py import voice.py from the root
 
         proc = subprocess.Popen(
             [

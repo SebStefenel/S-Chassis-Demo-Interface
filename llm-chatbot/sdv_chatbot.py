@@ -13,6 +13,7 @@ Run:
 import json
 import logging
 import os
+import sys
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -28,6 +29,11 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("sdv_chatbot")
+
+# ── Voice module path (voice.py lives at the repo root, not in llm-chatbot/) ──
+_SDV_ROOT = os.environ.get("SDV_ROOT", "")
+if _SDV_ROOT and _SDV_ROOT not in sys.path:
+    sys.path.insert(0, _SDV_ROOT)
 
 # ── Driver identity (injected by main.py orchestrator via env var) ────────────
 # When launched standalone, DRIVER_NAME is empty and the single shared history
@@ -622,8 +628,35 @@ def main():
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Prompt new input
-    user_input = st.chat_input("Ask your car assistant anything…")
+    # ── Voice input ───────────────────────────────────────────────────────────
+    # st.audio_input (Streamlit 1.37+) shows a record button in the UI.
+    # The driver taps to start recording, taps again to stop — no keyboard needed.
+    # Transcription happens locally via Vosk (offline, no cloud).
+    user_input: Optional[str] = None
+
+    audio = st.audio_input("🎤 Tap to speak")
+    if audio is not None:
+        audio_bytes = audio.read()
+        audio_hash  = hash(audio_bytes)
+        if audio_hash != st.session_state.get("_last_audio_hash"):
+            st.session_state["_last_audio_hash"] = audio_hash
+            try:
+                from voice import transcribe_wav
+                with st.spinner("Transcribing…"):
+                    transcript = transcribe_wav(audio_bytes)
+                if transcript:
+                    user_input = transcript
+                    st.caption(f"Heard: *{transcript}*")
+                else:
+                    st.warning("Didn't catch that — try speaking again.", icon="🎤")
+            except Exception as exc:
+                st.warning(f"Voice unavailable ({exc}) — use text input below.", icon="⚠️")
+
+    # Text input fallback (still works if voice isn't available)
+    text_input = st.chat_input("Or type here…")
+    if text_input:
+        user_input = text_input
+
     if user_input:
         # Show and record user message
         with st.chat_message("user"):
