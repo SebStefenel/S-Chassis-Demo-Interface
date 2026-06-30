@@ -152,8 +152,17 @@ class DemoOrchestrator:
                         return uid, name
 
             if time.time() > deadline:
-                log.info("Auth timeout — no match. Retrying.")
+                log.info("Auth timeout — no match.")
                 self.pub.unrecognized()
+
+                action = self._run_unrecognized_prompt(cap)
+                if action == "quit":
+                    return None
+                elif action == "enroll":
+                    result = self._run_inline_enrollment(cap)
+                    if result:
+                        return result   # (uid, name) — skip straight to CHAT
+                # 'retry' or cancelled enrollment → reset and scan again
                 deadline = time.time() + self.auth_timeout
                 frame_n  = 0
                 enrolled = sdv_db.get_all_embeddings(self.db_path)
@@ -172,6 +181,164 @@ class DemoOrchestrator:
             if d < best_dist:
                 best_dist, best_uid, best_name = d, uid, name
         return (best_uid, best_name, best_dist) if best_dist < self.match_threshold else None
+
+    # ── Unrecognized-driver prompt ────────────────────────────────────────────
+
+    def _run_unrecognized_prompt(self, cap) -> str:
+        """
+        Show a popup asking whether to enroll or retry.
+        Returns 'enroll', 'retry', or 'quit'.
+        On headless Pi the same question is printed to the terminal (SSH session).
+        """
+        if not self.display_enabled:
+            print("\n[S-Chassis] Driver not recognised.")
+            print("  [N]  Create new profile")
+            print("  [R]  Try again")
+            print("  [Q]  Quit")
+            while True:
+                choice = input("Choose: ").strip().lower()
+                if choice == "n":
+                    return "enroll"
+                elif choice == "r":
+                    return "retry"
+                elif choice == "q":
+                    return "quit"
+
+        while self._running:
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.05)
+                continue
+            cv2.imshow(_WINDOW, self._draw_unrecognized_popup(frame))
+            key = cv2.waitKey(100) & 0xFF
+            if key == ord("n"):
+                return "enroll"
+            elif key == ord("r"):
+                return "retry"
+            elif key in (ord("q"), 27):
+                return "quit"
+        return "quit"
+
+    def _draw_unrecognized_popup(self, frame: np.ndarray) -> np.ndarray:
+        disp = self._resize(frame)
+        dh, dw = disp.shape[:2]
+
+        # Dim the background
+        overlay = disp.copy()
+        cv2.rectangle(overlay, (0, 0), (dw, dh), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.55, disp, 0.45, 0, disp)
+
+        # Panel
+        pw, ph = min(500, dw - 40), 210
+        x1 = (dw - pw) // 2
+        y1 = (dh - ph) // 2
+        cv2.rectangle(disp, (x1, y1), (x1 + pw, y1 + ph), (28, 28, 28), -1)
+        cv2.rectangle(disp, (x1, y1), (x1 + pw, y1 + ph), (90, 90, 90), 2)
+
+        cx = dw // 2
+        cv2.putText(disp, "Driver not recognised",
+                    (cx - 185, y1 + 42), _FONT, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(disp, "[N]  Create new profile",
+                    (x1 + 30, y1 + 95), _FONT, 0.70, (80, 220, 80), 2, cv2.LINE_AA)
+        cv2.putText(disp, "[R]  Try again",
+                    (x1 + 30, y1 + 140), _FONT, 0.70, (60, 200, 255), 2, cv2.LINE_AA)
+        cv2.putText(disp, "[Q]  Quit",
+                    (x1 + 30, y1 + 185), _FONT, 0.60, (130, 130, 130), 1, cv2.LINE_AA)
+        return disp
+
+    # ── Inline enrollment ─────────────────────────────────────────────────────
+
+    def _run_inline_enrollment(self, cap) -> Optional[Tuple[int, str]]:
+        """
+        Capture face embeddings for a new driver directly from the live camera.
+        Name is entered via the terminal (one-time setup; SSH works fine on Pi).
+        Returns (uid, name) on success, None on cancel.
+        """
+        # Briefly show "check the terminal" so the user isn't confused
+        if self.display_enabled:
+            ret, frame = cap.read()
+            if ret:
+                disp = self._resize(frame)
+                cv2.rectangle(disp, (0, 0), (disp.shape[1], 52), (18, 18, 18), -1)
+                cv2.putText(disp, "Type your name in the terminal, then press Enter…",
+                            (10, 37), _FONT, 0.65, (255, 200, 60), 2, cv2.LINE_AA)
+                cv2.imshow(_WINDOW, disp)
+                cv2.waitKey(200)
+
+        name = input("\nEnter a name for the new profile: ").strip()
+        if not name:
+            log.info("Enrollment cancelled — no name entered.")
+            return None
+
+        existing = sdv_db.get_user_by_name(self.db_path, name)
+        if existing:
+            log.info("Profile '%s' already exists — adding more samples.", name)
+            uid = existing["id"]
+        else:
+            defaults = self.cfg.get("vehicle_settings_defaults", {
+                "seat_position": 3, "mirror_angle": 0,
+                "climate_temp_c": 22, "preferred_radio_station": "Unknown",
+            })
+            uid = sdv_db.add_user(self.db_path, name, defaults)
+            log.info("Created new profile: %s (uid=%d)", name, uid)
+
+        enr_cfg   = self.cfg.get("enrollment", {})
+        num_frames = enr_cfg.get("num_sample_frames", 10)
+        interval   = enr_cfg.get("capture_interval_frames", 8)
+        captured   = 0
+        frame_n    = 0
+        log.info("Enrolling %s — capturing %d face samples…", name, num_frames)
+
+        while captured < num_frames and self._running:
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.05)
+                continue
+
+            frame_n += 1
+
+            if self.display_enabled:
+                cv2.imshow(_WINDOW, self._draw_enrollment(frame, name, captured, num_frames))
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), 27):
+                    log.info("Enrollment cancelled mid-capture.")
+                    return None
+            else:
+                time.sleep(0.02)
+
+            if frame_n % interval == 0:
+                emb = self.engine.embed(frame)
+                if emb is not None:
+                    sdv_db.add_embedding(self.db_path, uid, emb)
+                    captured += 1
+                    log.info("  Captured %d/%d", captured, num_frames)
+                else:
+                    log.debug("  No face detected — keep facing the camera.")
+
+        if captured < num_frames:
+            log.warning("Enrollment incomplete (%d/%d) — profile saved with partial data.",
+                        captured, num_frames)
+            return None
+
+        log.info("Enrollment complete for %s.", name)
+        return uid, name
+
+    def _draw_enrollment(self, frame: np.ndarray, name: str,
+                          captured: int, total: int) -> np.ndarray:
+        disp = self._resize(frame)
+        dh, dw = disp.shape[:2]
+        cv2.rectangle(disp, (0, 0), (dw, 52), (18, 18, 18), -1)
+        cv2.putText(disp, f"ENROLLING: {name}   {captured}/{total}",
+                    (10, 37), _FONT, 0.80, (255, 200, 60), 2, cv2.LINE_AA)
+        bar_w = int((captured / total) * (dw - 20))
+        cv2.rectangle(disp, (10, 58), (dw - 10, 76), (50, 50, 50), -1)
+        if bar_w > 0:
+            cv2.rectangle(disp, (10, 58), (10 + bar_w, 76), (80, 220, 80), -1)
+        cv2.putText(disp, "Look directly at the camera",
+                    (10, 100), _FONT, 0.60, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.putText(disp, "Q — cancel", (8, dh - 8),
+                    _FONT, 0.42, (90, 90, 90), 1, cv2.LINE_AA)
+        return disp
 
     # ── CHAT ──────────────────────────────────────────────────────────────────
 
