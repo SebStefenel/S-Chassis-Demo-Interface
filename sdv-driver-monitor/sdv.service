@@ -1,0 +1,37 @@
+# SDV Driver Monitor — systemd service unit
+#
+# Install:
+#   sudo cp sdv.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable sdv
+#   sudo systemctl start sdv
+#
+# View logs:
+#   journalctl -u sdv -f
+#
+# EDIT WorkingDirectory and ExecStart to match the actual path on your Pi.
+
+[Unit]
+Description=SDV Driver Monitoring Service
+Documentation=https://github.com/your-repo/sdv
+# Wait for the camera device to be ready
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+User=pi
+# ↓ Change to the actual project path on your Pi
+WorkingDirectory=/home/pi/FaceDetection
+ExecStart=/home/pi/FaceDetection/venv/bin/python sdv_monitor.py
+Restart=always
+RestartSec=5
+# Give the camera time to initialise after a crash restart
+StartLimitIntervalSec=60
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sdv-monitor
+
+[Install]
+WantedBy=multi-user.target

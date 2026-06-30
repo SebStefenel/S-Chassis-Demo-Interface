@@ -1,0 +1,40 @@
+{
+  "face_recognition": {
+    "match_threshold": 0.40,
+    "auth_timeout_seconds": 10,
+    "auth_check_every_n_frames": 5
+  },
+  "models": {
+    "det_model": "models/face_detection_yunet_2023mar.onnx",
+    "rec_model": "models/face_recognition_sface_2021dec.onnx",
+    "landmark_model": "models/face_landmarker.task"
+  },
+  "drowsiness": {
+    "ear_threshold": 0.25,
+    "consecutive_frames_alert": 20
+  },
+  "database": {
+    "path": "~/.sdv/sdv_users.db"
+  },
+  "enrollment": {
+    "num_sample_frames": 10,
+    "capture_interval_frames": 8
+  },
+  "camera": {
+    "source": 0
+  },
+  "display": {
+    "enabled": true,
+    "width": 640
+  },
+  "score": {
+    "host": "127.0.0.1",
+    "port": 55555
+  },
+  "vehicle_settings_defaults": {
+    "seat_position": 3,
+    "mirror_angle": 0,
+    "climate_temp_c": 22,
+    "preferred_radio_station": "Unknown"
+  }
+}
