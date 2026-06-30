@@ -1,0 +1,22 @@
+# S-Chassis Demo Interface — combined dependencies
+# Install on Raspberry Pi:
+#   pip install -r requirements.txt
+#
+# Note: opencv-python ships the YuNet and SFace models built-in (>=4.8.0).
+# If you hit install errors for opencv-python on Pi, try the headless variant:
+#   pip install opencv-python-headless>=4.8.0
+
+# ── Vision / driver monitor ───────────────────────────────────────────────────
+numpy>=1.24.0
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+
+# ── LLM chatbot ───────────────────────────────────────────────────────────────
+groq>=0.9.0
+streamlit>=1.35.0
+python-dotenv>=1.0.0
+
+# ── Vehicle signals (optional — gracefully disabled if broker is unreachable) ─
+Flask>=2.0.0
+flask-cors>=4.0.1
+kuksa-client>=0.4.0

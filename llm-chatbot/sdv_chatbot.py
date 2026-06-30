@@ -29,9 +29,23 @@ logging.basicConfig(
 )
 log = logging.getLogger("sdv_chatbot")
 
+# ── Driver identity (injected by main.py orchestrator via env var) ────────────
+# When launched standalone, DRIVER_NAME is empty and the single shared history
+# file is used (backwards-compatible).  When launched by main.py after face
+# recognition, DRIVER_NAME is set and each driver gets their own history file
+# stored in ~/.sdv/ so memories never bleed between drivers.
+DRIVER_NAME: str = os.environ.get("SDV_DRIVER_NAME", "").strip()
+
+_HISTORY_DIR = Path(os.path.expanduser("~/.sdv"))
+_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 MODEL_ID          = "llama-3.1-8b-instant"
-HISTORY_FILE      = Path("vehicle_history.json")
+HISTORY_FILE      = (
+    _HISTORY_DIR / f"chat_history_{DRIVER_NAME}.json"
+    if DRIVER_NAME
+    else Path("vehicle_history.json")
+)
 API_TIMEOUT       = 20          # seconds – critical on moving-vehicle networks
 MAX_RETRIES       = 1           # one silent retry on transient failures
 
@@ -73,7 +87,7 @@ def _blank_history() -> dict:
         "created_at": _now_utc(),
         "last_updated": _now_utc(),
         "driver_profile": {
-            "name": None,
+            "name": DRIVER_NAME or None,
         },
         "vehicle_context": {
             "vehicle_type": "SDV demo car",
@@ -408,8 +422,15 @@ If the driver asks a complex question, give the key answer first, then offer to 
 
 def build_system_prompt(history: dict) -> str:
     snippet = history_to_prompt_snippet(history)
+    prompt  = _BASE_SYSTEM + "\n\n" + snippet
+    if DRIVER_NAME:
+        prompt += (
+            f"\n\nThe driver has been identified by face recognition as {DRIVER_NAME}. "
+            f"Always address them by name naturally. "
+            f"Keep a warm, personal tone throughout the conversation."
+        )
     log.info("System prompt assembled — history snippet: %d chars", len(snippet))
-    return _BASE_SYSTEM + "\n\n" + snippet
+    return prompt
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -427,6 +448,8 @@ def _init_session_state():
         st.session_state.session_saved = False
     if "status_msg"    not in st.session_state:
         st.session_state.status_msg    = ""
+    if "greeted"       not in st.session_state:
+        st.session_state.greeted       = False
 
 
 def _resolve_client(api_key: str):
@@ -446,8 +469,9 @@ def _resolve_client(api_key: str):
 
 
 def main():
+    page_title = f"SDV Assistant — {DRIVER_NAME}" if DRIVER_NAME else "SDV Car Assistant"
     st.set_page_config(
-        page_title="SDV Car Assistant",
+        page_title=page_title,
         page_icon="🚗",
         layout="wide",
         initial_sidebar_state="expanded",
@@ -536,6 +560,33 @@ def main():
             st.rerun()
 
         st.divider()
+
+        # ── End Session (only shown when launched by the orchestrator) ─────
+        if DRIVER_NAME:
+            st.subheader("Drive Mode")
+            st.caption(
+                "Click below when you're done chatting. "
+                "The system will start drowsiness monitoring."
+            )
+            if st.button("🚗 End Session & Start Driving",
+                         use_container_width=True, type="primary"):
+                # Sync unsaved conversation before exiting
+                if api_key and st.session_state.messages and not st.session_state.session_saved:
+                    client = _resolve_client(api_key)
+                    with st.spinner("Saving your session…"):
+                        updated, _ = save_and_sync_session(
+                            client,
+                            st.session_state.messages,
+                            st.session_state.history,
+                        )
+                    st.session_state.history = updated
+                st.info("Starting drowsiness monitor… you can close this tab.")
+                # os._exit terminates the Streamlit server process immediately,
+                # which unblocks proc.wait() in main.py and triggers MONITOR phase.
+                import os as _os
+                _os._exit(0)
+            st.divider()
+
         st.caption(f"Model: `{MODEL_ID}`  |  Timeout: {API_TIMEOUT}s")
 
     # ── Main chat area ─────────────────────────────────────────────────────
@@ -546,6 +597,25 @@ def main():
         st.stop()
 
     client = _resolve_client(api_key)
+
+    # ── Opening greeting (only when driver is known and chat is fresh) ─────────
+    # Generates one assistant message that addresses the driver by name, using
+    # their stored history as context.  Runs once per session, not on every rerun.
+    if DRIVER_NAME and not st.session_state.greeted and not st.session_state.messages:
+        with st.spinner(f"Welcome back, {DRIVER_NAME}…"):
+            greeting_prompt = build_system_prompt(st.session_state.history) + (
+                f"\n\nGreet {DRIVER_NAME} warmly and by name. "
+                f"Keep it to 1–2 sentences. Do not ask how you can help yet."
+            )
+            greeting = chat_completion(
+                client,
+                [{"role": "system", "content": greeting_prompt}],
+                temperature=0.8,
+                max_tokens=80,
+            )
+        st.session_state.messages.append({"role": "assistant", "content": greeting})
+        st.session_state.greeted = True
+        st.rerun()
 
     # Render message history
     for msg in st.session_state.messages:
