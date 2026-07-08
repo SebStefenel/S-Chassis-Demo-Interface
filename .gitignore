@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Secrets
+.env
+
+# Vosk model (auto-downloaded at runtime)
+vosk-model*/
+
+# Models directory (large binary files — download via setup instructions)
+sdv-driver-monitor/models/
+
+# OS
+.DS_Store
+Thumbs.db
