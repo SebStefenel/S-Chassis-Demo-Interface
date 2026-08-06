@@ -554,7 +554,8 @@ class DemoOrchestrator:
         signal.signal(signal.SIGINT,  _handle_stop)
         signal.signal(signal.SIGTERM, _handle_stop)
 
-        cap = cv2.VideoCapture(cam_src)
+        _backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_V4L2
+        cap = cv2.VideoCapture(cam_src, _backend)
         if not cap.isOpened():
             log.error("Cannot open camera source: %s", cam_src)
             sys.exit(1)
@@ -584,7 +585,7 @@ class DemoOrchestrator:
                 self._run_chat(uid, name)
 
                 # ── Phase 3: MONITOR ───────────────────────────────────────
-                cap = cv2.VideoCapture(cam_src)
+                cap = cv2.VideoCapture(cam_src, _backend)
                 if not cap.isOpened():
                     log.error("Cannot reopen camera for MONITOR phase.")
                     break
