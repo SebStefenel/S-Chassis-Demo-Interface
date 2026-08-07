@@ -23,6 +23,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -123,6 +124,9 @@ class DemoOrchestrator:
         unique   = len(set(n for _, n, _ in enrolled))
         log.info("AUTH — %d driver(s) enrolled. Scanning…", unique)
         self.pub.scanning()
+
+        if self.display_enabled:
+            self._make_fullscreen_window()
 
         deadline = time.time() + self.auth_timeout
         frame_n  = 0
@@ -288,6 +292,44 @@ class DemoOrchestrator:
                     (x1 + 30, y1 + 185), _FONT, 0.60, (130, 130, 130), 1, cv2.LINE_AA)
         return disp
 
+    def _ask_name_overlay(self, cap) -> str:
+        """On-screen keyboard-typed name input rendered over the live camera feed."""
+        typed: list = []
+        while self._running:
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.05)
+                continue
+            disp = self._resize(frame)
+            dh, dw = disp.shape[:2]
+            overlay = disp.copy()
+            cv2.rectangle(overlay, (0, 0), (dw, dh), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.55, disp, 0.45, 0, disp)
+            bw = min(520, dw - 60)
+            bh = 130
+            bx = (dw - bw) // 2
+            by = (dh - bh) // 2
+            cv2.rectangle(disp, (bx, by), (bx + bw, by + bh), (28, 28, 28), -1)
+            cv2.rectangle(disp, (bx, by), (bx + bw, by + bh), (90, 90, 90), 2)
+            cv2.putText(disp, "Enter your name:",
+                        (bx + 15, by + 38), _FONT, 0.75, (200, 200, 200), 1, cv2.LINE_AA)
+            cv2.putText(disp, "".join(typed) + "|",
+                        (bx + 15, by + 100), _FONT, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(disp, "Enter to confirm   Esc to cancel",
+                        (bx + 15, by + bh + 28), _FONT, 0.50, (120, 120, 120), 1, cv2.LINE_AA)
+            cv2.imshow(_WINDOW, disp)
+            key = cv2.waitKey(50) & 0xFF
+            if key in (13, 10):
+                break
+            elif key == 27:
+                return ""
+            elif key in (8, 127):
+                if typed:
+                    typed.pop()
+            elif 32 <= key <= 126 and len(typed) < 24:
+                typed.append(chr(key))
+        return "".join(typed).strip().title()
+
     def _ask_name_by_voice(self, cap) -> str:
         """
         Prompt the driver to say their name. Shows an overlay while listening.
@@ -319,7 +361,10 @@ class DemoOrchestrator:
             name = ""
 
         if not name:
-            name = input("Could not hear name — type it here: ").strip()
+            if self.display_enabled:
+                name = self._ask_name_overlay(cap)
+            else:
+                name = input("Could not hear name — type it here: ").strip()
 
         return name
 
@@ -447,6 +492,15 @@ class DemoOrchestrator:
             cwd=_CHATBOT_DIR,   # so .env and relative paths resolve correctly
         )
 
+        if self.display_enabled:
+            def _launch_browser():
+                time.sleep(3)
+                for browser in ["chromium-browser", "chromium", "google-chrome", "firefox"]:
+                    if shutil.which(browser):
+                        subprocess.Popen([browser, "--kiosk", "http://localhost:8501"])
+                        break
+            threading.Thread(target=_launch_browser, daemon=True).start()
+
         try:
             proc.wait()
         except KeyboardInterrupt:
@@ -470,8 +524,7 @@ class DemoOrchestrator:
         last_ear: Optional[float] = None
 
         if self.display_enabled:
-            cv2.namedWindow(_WINDOW, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(_WINDOW, self.display_width, int(self.display_width * 0.75))
+            self._make_fullscreen_window()
 
         while self._running:
             ret, frame = cap.read()
@@ -498,6 +551,21 @@ class DemoOrchestrator:
                 time.sleep(0.02)
 
     # ── Display helpers ───────────────────────────────────────────────────────
+
+    def _make_fullscreen_window(self) -> None:
+        cv2.namedWindow(_WINDOW, cv2.WINDOW_NORMAL)
+        cv2.imshow(_WINDOW, np.zeros((2, 2, 3), np.uint8))
+        cv2.waitKey(200)
+        cv2.setWindowProperty(_WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        cv2.waitKey(1)
+        if shutil.which("wmctrl"):
+            def _force():
+                time.sleep(0.3)
+                subprocess.run(
+                    ["wmctrl", "-r", _WINDOW, "-b", "add,fullscreen"],
+                    capture_output=True,
+                )
+            threading.Thread(target=_force, daemon=True).start()
 
     def _resize(self, frame: np.ndarray) -> np.ndarray:
         h, w  = frame.shape[:2]
@@ -561,10 +629,6 @@ class DemoOrchestrator:
             sys.exit(1)
         log.info("Camera opened (source=%s). Display=%s.", cam_src, self.display_enabled)
 
-        if self.display_enabled:
-            cv2.namedWindow(_WINDOW, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(_WINDOW, self.display_width, int(self.display_width * 0.75))
-
         try:
             while self._running:
 
@@ -592,8 +656,7 @@ class DemoOrchestrator:
 
                 if self.display_enabled:
                     cv2.namedWindow(_WINDOW, cv2.WINDOW_NORMAL)
-                    cv2.resizeWindow(_WINDOW, self.display_width,
-                                     int(self.display_width * 0.75))
+                    cv2.setWindowProperty(_WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
                 self._run_monitor(cap, name)
                 # Loop back to AUTH for the next driver / next session
