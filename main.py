@@ -39,6 +39,11 @@ _ROOT        = os.path.dirname(os.path.abspath(__file__))
 _MONITOR_DIR = os.path.join(_ROOT, "sdv-driver-monitor")
 _CHATBOT_DIR = os.path.join(_ROOT, "llm-chatbot")
 
+# ── IPC files shared between main.py and sdv_chatbot.py ──────────────────────
+_SDV_DIR           = os.path.expanduser("~/.sdv")
+_DRIVER_READY_FILE = os.path.join(_SDV_DIR, "driver_ready.txt")
+_SESSION_DONE_FILE = os.path.join(_SDV_DIR, "session_done.txt")
+
 sys.path.insert(0, _MONITOR_DIR)
 
 import sdv_db
@@ -110,7 +115,32 @@ class DemoOrchestrator:
             port=score_cfg.get("port", 55555),
         )
 
-        self._running = True
+        self._running        = True
+        self._streamlit_proc = None
+
+    # ── Streamlit pre-launch ──────────────────────────────────────────────────
+
+    def _start_streamlit(self) -> None:
+        """Launch Streamlit in background at app start so it's ready when AUTH finishes."""
+        os.makedirs(_SDV_DIR, exist_ok=True)
+        for f in (_DRIVER_READY_FILE, _SESSION_DONE_FILE):
+            if os.path.exists(f):
+                os.remove(f)
+        env = os.environ.copy()
+        env["SDV_ROOT"] = _ROOT
+        self._streamlit_proc = subprocess.Popen(
+            [
+                sys.executable, "-m", "streamlit", "run",
+                os.path.join(_CHATBOT_DIR, "sdv_chatbot.py"),
+                "--server.headless",          "true",
+                "--server.address",           "0.0.0.0",
+                "--server.port",              "8501",
+                "--browser.gatherUsageStats", "false",
+            ],
+            env=env,
+            cwd=_CHATBOT_DIR,
+        )
+        log.info("Streamlit pre-launched (pid=%d)", self._streamlit_proc.pid)
 
     # ── AUTH ──────────────────────────────────────────────────────────────────
 
@@ -454,58 +484,54 @@ class DemoOrchestrator:
     # ── CHAT ──────────────────────────────────────────────────────────────────
 
     def _run_chat(self, uid: int, name: str) -> None:
-        """
-        Launch the Streamlit chatbot for this driver and block until it exits.
-
-        The driver's name is passed via the SDV_DRIVER_NAME environment variable.
-        The chatbot loads that driver's personal history file and greets them by name.
-        When the driver clicks "End Session", the chatbot calls os._exit(0) which
-        terminates the subprocess and unblocks proc.wait() here.
-
-        On a headless Pi the user opens http://<pi-ip>:8501 in any browser on the
-        same network.  On a Pi with a display the browser opens automatically if
-        server.headless is false — adjust the flag below as needed.
-        """
         settings = sdv_db.get_user_settings(self.db_path, uid)
         self.pub.authenticated(name, settings)
 
         if self.display_enabled:
             cv2.destroyAllWindows()
 
-        log.info("Launching chatbot for driver: %s", name)
-        log.info("Chat UI available at  http://0.0.0.0:8501  (or <pi-ip>:8501)")
+        # Write driver name to IPC file so the pre-launched Streamlit can pick it up
+        os.makedirs(_SDV_DIR, exist_ok=True)
+        if os.path.exists(_SESSION_DONE_FILE):
+            os.remove(_SESSION_DONE_FILE)
+        with open(_DRIVER_READY_FILE, "w") as f:
+            f.write(name)
+        log.info("Driver ready signal written for: %s", name)
+        log.info("Chat UI available at http://0.0.0.0:8501")
 
-        env = os.environ.copy()
-        env["SDV_DRIVER_NAME"] = name
-        env["SDV_ROOT"] = _ROOT     # lets sdv_chatbot.py import voice.py from the root
-
-        proc = subprocess.Popen(
-            [
-                sys.executable, "-m", "streamlit", "run",
-                os.path.join(_CHATBOT_DIR, "sdv_chatbot.py"),
-                "--server.headless",          "true",
-                "--server.address",           "0.0.0.0",
-                "--server.port",              "8501",
-                "--browser.gatherUsageStats", "false",
-            ],
-            env=env,
-            cwd=_CHATBOT_DIR,   # so .env and relative paths resolve correctly
-        )
-
+        # Open the browser — Streamlit is already running so 1s is enough
+        browser_procs: list = []
         if self.display_enabled:
             def _launch_browser():
-                time.sleep(3)
+                time.sleep(1)
                 for browser in ["chromium-browser", "chromium", "google-chrome", "firefox"]:
                     if shutil.which(browser):
-                        subprocess.Popen([browser, "--kiosk", "http://localhost:8501"])
+                        browser_procs.append(
+                            subprocess.Popen([browser, "--kiosk", "http://localhost:8501"])
+                        )
                         break
             threading.Thread(target=_launch_browser, daemon=True).start()
 
+        # Block until chatbot writes session_done.txt (driver clicked "End Session")
         try:
-            proc.wait()
+            while self._running:
+                if os.path.exists(_SESSION_DONE_FILE):
+                    os.remove(_SESSION_DONE_FILE)
+                    break
+                time.sleep(0.5)
         except KeyboardInterrupt:
-            proc.terminate()
-            proc.wait()
+            pass
+
+        # Close browser kiosk window
+        for p in browser_procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+        # Remove driver-ready signal so Streamlit shows the waiting screen next session
+        if os.path.exists(_DRIVER_READY_FILE):
+            os.remove(_DRIVER_READY_FILE)
 
         log.info("Chat session ended for driver: %s. Starting drowsiness monitor.", name)
 
@@ -629,6 +655,9 @@ class DemoOrchestrator:
             sys.exit(1)
         log.info("Camera opened (source=%s). Display=%s.", cam_src, self.display_enabled)
 
+        # Pre-launch Streamlit now so it's fully ready when AUTH finishes
+        self._start_streamlit()
+
         try:
             while self._running:
 
@@ -666,6 +695,9 @@ class DemoOrchestrator:
             if self.display_enabled:
                 cv2.destroyAllWindows()
             self.pub.close()
+            if self._streamlit_proc is not None:
+                self._streamlit_proc.terminate()
+                self._streamlit_proc.wait()
             log.info("S-Chassis Demo stopped cleanly.")
 
 

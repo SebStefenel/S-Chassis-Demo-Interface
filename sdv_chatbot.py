@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sys
+import time
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -35,23 +36,29 @@ _SDV_ROOT = os.environ.get("SDV_ROOT", "")
 if _SDV_ROOT and _SDV_ROOT not in sys.path:
     sys.path.insert(0, _SDV_ROOT)
 
-# ── Driver identity (injected by main.py orchestrator via env var) ────────────
-# When launched standalone, DRIVER_NAME is empty and the single shared history
-# file is used (backwards-compatible).  When launched by main.py after face
-# recognition, DRIVER_NAME is set and each driver gets their own history file
-# stored in ~/.sdv/ so memories never bleed between drivers.
+# ── Driver identity ───────────────────────────────────────────────────────────
+# When launched standalone, DRIVER_NAME may be set via SDV_DRIVER_NAME env var.
+# When pre-launched by main.py (Streamlit starts before AUTH finishes), the env
+# var is empty; the driver name arrives later via _DRIVER_READY_FILE.
 DRIVER_NAME: str = os.environ.get("SDV_DRIVER_NAME", "").strip()
 
-_HISTORY_DIR = Path(os.path.expanduser("~/.sdv"))
+_HISTORY_DIR       = Path(os.path.expanduser("~/.sdv"))
 _HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+# IPC files written/read by main.py ↔ sdv_chatbot.py
+_DRIVER_READY_FILE = os.path.join(str(_HISTORY_DIR), "driver_ready.txt")
+_SESSION_DONE_FILE = os.path.join(str(_HISTORY_DIR), "session_done.txt")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 MODEL_ID          = "llama-3.1-8b-instant"
-HISTORY_FILE      = (
-    _HISTORY_DIR / f"chat_history_{DRIVER_NAME}.json"
-    if DRIVER_NAME
-    else Path("vehicle_history.json")
-)
+
+
+def _history_file(driver_name: str) -> Path:
+    return (
+        _HISTORY_DIR / f"chat_history_{driver_name}.json"
+        if driver_name
+        else Path("vehicle_history.json")
+    )
 API_TIMEOUT       = 20          # seconds – critical on moving-vehicle networks
 MAX_RETRIES       = 1           # one silent retry on transient failures
 
@@ -87,13 +94,13 @@ def _now_utc() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
-def _blank_history() -> dict:
+def _blank_history(driver_name: str = "") -> dict:
     return {
         "schema_version": "1.1",
         "created_at": _now_utc(),
         "last_updated": _now_utc(),
         "driver_profile": {
-            "name": DRIVER_NAME or None,
+            "name": driver_name or None,
         },
         "vehicle_context": {
             "vehicle_type": "SDV demo car",
@@ -114,27 +121,29 @@ def _blank_history() -> dict:
     }
 
 
-def load_history() -> dict:
-    """Read vehicle_history.json; re-initialise cleanly if missing or corrupt."""
-    if HISTORY_FILE.exists():
+def load_history(driver_name: str = "") -> dict:
+    """Read history file for driver; re-initialise cleanly if missing or corrupt."""
+    path = _history_file(driver_name)
+    if path.exists():
         try:
-            data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
-            log.info("History loaded: %d entries from %s", len(data.get("entries", [])), HISTORY_FILE)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            log.info("History loaded: %d entries from %s", len(data.get("entries", [])), path)
             return data
         except Exception as exc:
             log.warning("Corrupt history file – reinitialising. Reason: %s", exc)
 
-    fresh = _blank_history()
-    HISTORY_FILE.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
-    log.info("Initialised fresh history file at %s", HISTORY_FILE.resolve())
+    fresh = _blank_history(driver_name)
+    path.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
+    log.info("Initialised fresh history file at %s", path.resolve())
     return fresh
 
 
-def save_history(history: dict) -> None:
+def save_history(history: dict, driver_name: str = "") -> None:
+    path = _history_file(driver_name)
     history["last_updated"] = _now_utc()
-    HISTORY_FILE.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(history, indent=2), encoding="utf-8")
     log.info("History saved: %d entries, %.1f KB", len(history.get("entries", [])),
-             HISTORY_FILE.stat().st_size / 1024)
+             path.stat().st_size / 1024)
 
 
 def history_to_prompt_snippet(history: dict) -> str:
@@ -389,7 +398,7 @@ def condense_history_if_needed(client, history: dict) -> dict:
     return history
 
 
-def save_and_sync_session(client, messages: list[dict], history: dict) -> tuple[dict, str]:
+def save_and_sync_session(client, messages: list[dict], history: dict, driver_name: str = "") -> tuple[dict, str]:
     """
     Full end-of-session pipeline:
       1. Extract new facts from the conversation.
@@ -404,7 +413,7 @@ def save_and_sync_session(client, messages: list[dict], history: dict) -> tuple[
     new_facts = extract_new_facts(client, messages, history)
     history   = merge_facts_into_history(history, new_facts)
     history   = condense_history_if_needed(client, history)
-    save_history(history)
+    save_history(history, driver_name)
 
     added = len(new_facts)
     total = len(history.get("entries", []))
@@ -426,12 +435,12 @@ If the driver asks a complex question, give the key answer first, then offer to 
 """
 
 
-def build_system_prompt(history: dict) -> str:
+def build_system_prompt(history: dict, driver_name: str = "") -> str:
     snippet = history_to_prompt_snippet(history)
     prompt  = _BASE_SYSTEM + "\n\n" + snippet
-    if DRIVER_NAME:
+    if driver_name:
         prompt += (
-            f"\n\nThe driver has been identified by face recognition as {DRIVER_NAME}. "
+            f"\n\nThe driver has been identified by face recognition as {driver_name}. "
             f"Always address them by name naturally. "
             f"Keep a warm, personal tone throughout the conversation."
         )
@@ -443,11 +452,11 @@ def build_system_prompt(history: dict) -> str:
 #  Streamlit UI
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _init_session_state():
+def _init_session_state(driver_name: str = ""):
     if "messages"      not in st.session_state:
-        st.session_state.messages      = []   # user+assistant turns only
+        st.session_state.messages      = []
     if "history"       not in st.session_state:
-        st.session_state.history       = load_history()
+        st.session_state.history       = load_history(driver_name)
     if "client"        not in st.session_state:
         st.session_state.client        = None
     if "session_saved" not in st.session_state:
@@ -475,14 +484,37 @@ def _resolve_client(api_key: str):
 
 
 def main():
-    page_title = f"SDV Assistant — {DRIVER_NAME}" if DRIVER_NAME else "SDV Car Assistant"
     st.set_page_config(
-        page_title=page_title,
+        page_title="SDV Car Assistant",
         page_icon="🚗",
         layout="wide",
         initial_sidebar_state="expanded",
     )
-    _init_session_state()
+
+    # ── Resolve driver name ───────────────────────────────────────────────────
+    # Priority: session state (already resolved) → env var → IPC file → waiting
+    if "driver_name" not in st.session_state:
+        if DRIVER_NAME:
+            st.session_state.driver_name = DRIVER_NAME
+        elif os.path.exists(_DRIVER_READY_FILE):
+            try:
+                with open(_DRIVER_READY_FILE) as _f:
+                    st.session_state.driver_name = _f.read().strip()
+            except Exception:
+                st.session_state.driver_name = ""
+        else:
+            st.session_state.driver_name = ""
+
+    driver_name: str = st.session_state.driver_name
+
+    if not driver_name:
+        st.title("🚗 SDV Assistant")
+        st.info("Waiting for driver identification…")
+        time.sleep(1)
+        st.rerun()
+        return
+
+    _init_session_state(driver_name)
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
@@ -550,6 +582,7 @@ def main():
                         client,
                         st.session_state.messages,
                         st.session_state.history,
+                        driver_name,
                     )
                 st.session_state.history       = updated
                 st.session_state.session_saved = True
@@ -568,7 +601,7 @@ def main():
         st.divider()
 
         # ── End Session (only shown when launched by the orchestrator) ─────
-        if DRIVER_NAME:
+        if driver_name:
             st.subheader("Drive Mode")
             st.caption(
                 "Click below when you're done chatting. "
@@ -576,7 +609,6 @@ def main():
             )
             if st.button("🚗 End Session & Start Driving",
                          use_container_width=True, type="primary"):
-                # Sync unsaved conversation before exiting
                 if api_key and st.session_state.messages and not st.session_state.session_saved:
                     client = _resolve_client(api_key)
                     with st.spinner("Saving your session…"):
@@ -584,13 +616,22 @@ def main():
                             client,
                             st.session_state.messages,
                             st.session_state.history,
+                            driver_name,
                         )
                     st.session_state.history = updated
                 st.info("Starting drowsiness monitor… you can close this tab.")
-                # os._exit terminates the Streamlit server process immediately,
-                # which unblocks proc.wait() in main.py and triggers MONITOR phase.
-                import os as _os
-                _os._exit(0)
+                # Signal main.py to proceed to the MONITOR phase
+                try:
+                    with open(_SESSION_DONE_FILE, "w") as _f:
+                        _f.write("done")
+                except Exception:
+                    pass
+                # Clear driver from session so the next session shows waiting screen
+                del st.session_state["driver_name"]
+                st.session_state.messages      = []
+                st.session_state.greeted       = False
+                st.session_state.session_saved = False
+                st.rerun()
             st.divider()
 
         st.caption(f"Model: `{MODEL_ID}`  |  Timeout: {API_TIMEOUT}s")
@@ -605,12 +646,10 @@ def main():
     client = _resolve_client(api_key)
 
     # ── Opening greeting (only when driver is known and chat is fresh) ─────────
-    # Generates one assistant message that addresses the driver by name, using
-    # their stored history as context.  Runs once per session, not on every rerun.
-    if DRIVER_NAME and not st.session_state.greeted and not st.session_state.messages:
-        with st.spinner(f"Welcome back, {DRIVER_NAME}…"):
-            greeting_prompt = build_system_prompt(st.session_state.history) + (
-                f"\n\nGreet {DRIVER_NAME} warmly and by name. "
+    if driver_name and not st.session_state.greeted and not st.session_state.messages:
+        with st.spinner(f"Welcome back, {driver_name}…"):
+            greeting_prompt = build_system_prompt(st.session_state.history, driver_name) + (
+                f"\n\nGreet {driver_name} warmly and by name. "
                 f"Keep it to 1–2 sentences. Do not ask how you can help yet."
             )
             greeting = chat_completion(
@@ -664,7 +703,7 @@ def main():
         st.session_state.messages.append({"role": "user", "content": user_input})
 
         # Build context: system prompt (with injected history) + full turn history
-        system_prompt = build_system_prompt(st.session_state.history)
+        system_prompt = build_system_prompt(st.session_state.history, driver_name)
         full_context  = [{"role": "system", "content": system_prompt}] + st.session_state.messages
 
         # Get and show assistant reply
